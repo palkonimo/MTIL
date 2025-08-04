@@ -436,7 +436,7 @@ class CrossModalAttention(nn.Module):
         super().__init__()
         # 层次化投影 + 非线性增强
         self.proj_lowdim = nn.Sequential(
-            nn.Linear(14, 128),
+            nn.Linear(lowdim_dim, 128),
             nn.GELU(),
             nn.Linear(128, 512),
             nn.Dropout(0.2),
@@ -538,7 +538,8 @@ class MambaPolicy(nn.Module):
         self.d_model = d_model
         self.action_dim = action_dim
         self.sum_camera_feats = sum_camera_feats
-        dinov2_dim = 1024  # dinov2_vitl14的dim=1024
+        dinov2_dim = 384  # dinov2_vitl14的dim=1024
+        # dinov2_dim = 1024
         if mamba_cfg is None or not isinstance(mamba_cfg, MambaConfig):
             mamba_cfg = MambaConfig()
         self.mamba_cfg = mamba_cfg
@@ -569,7 +570,7 @@ class MambaPolicy(nn.Module):
         )
         # 输入特征的拼接和投影
         # self.in_dim = embed_dim + lowdim_dim
-        self.cross_attn = CrossModalAttention(d_model)
+        self.cross_attn = CrossModalAttention(d_model, lowdim_dim=lowdim_dim)
         self.in_dim = embed_dim * len(self.camera_names)
         # 跨相机交叉注意力模块
         self.num_cameras = len(camera_names)
@@ -650,7 +651,7 @@ class MambaPolicy(nn.Module):
         """
         B, _ = lowdim_t.shape
         device = lowdim_t.device
-
+        
         # 1. 多相机特征提取
 
         feats_all = []
@@ -716,9 +717,9 @@ class MambaPolicy(nn.Module):
             hidden = hidden_out
             residual = hidden_out
 
-            # d) out => action
+        # d) out => action
         action_flat = self.out_proj(hidden)# => [B, 16×14=224]
-        action_t = action_flat.view(-1, self.future_steps, 14)  # => [B,16,14]
+        action_t = action_flat.view(-1, self.future_steps, self.action_dim)  # => [B,16,14]
         return action_t, new_states
 
 # forward一般不使用
