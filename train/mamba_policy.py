@@ -518,7 +518,6 @@ class MambaPolicy(nn.Module):
     def __init__(
         self,
         camera_names,
-        img_size=(640, 480),
         embed_dim=2048,
         lowdim_dim=14,
         d_model=2048,
@@ -528,46 +527,54 @@ class MambaPolicy(nn.Module):
         block_cfg=None,  # Block 的配置
         mamba_cfg=None,  # Mamba2 的配置
         future_steps=16,  # 预测未来16步，可调
+        backbone_dim = 1024,
+        backbone = FrozenDinov2(layer_index=-4),
+        use_spatial_adapter: bool = True,
+        low_res_adapter: bool = False,
     ):
         super().__init__()
         self.camera_names = camera_names
         self.future_steps = future_steps
-        self.img_size = img_size
+        self.low_res_adapter = low_res_adapter
         self.lowdim_dim = lowdim_dim
         self.embed_dim = embed_dim
         self.d_model = d_model
         self.action_dim = action_dim
         self.sum_camera_feats = sum_camera_feats
-        dinov2_dim = 384  # dinov2_vitl14的dim=1024
-        # dinov2_dim = 1024
         if mamba_cfg is None or not isinstance(mamba_cfg, MambaConfig):
             mamba_cfg = MambaConfig()
         self.mamba_cfg = mamba_cfg
         # 初始化DINOv2特征提取器
-        self.shared_backbone = FrozenDinov2(layer_index=-4)
+        self.shared_backbone = backbone
 
-        # 添加空间压缩层（保持合理分辨率）
-        self.spatial_adapter = nn.Sequential(
-            nn.Conv2d(dinov2_dim, 512, 3, padding=1), #[B, 512, 45, 34]
-            nn.ReLU(),
-            nn.Conv2d(512, 256, 3, padding=1), #[B, 256, 45, 34]
-            nn.ReLU(),
-            nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),  # 输出 [B,128,22,17]
-            nn.Flatten(1), # [B, 128*(H*W)],输入为（640，480）时为（B, 128*23*18=52992）
-            nn.Linear(128*23*18, self.embed_dim),  # [B, embed_dim]
-            nn.LayerNorm(2048),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.10)
-        )
-        self.spatial_adpater_low = nn.Sequential(
-            nn.Conv2d(dinov2_dim, 512, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(512, 256, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(256, 128, 3, padding=1),
-            nn.Flatten(1),  # [B, 128*(H*W)],输入为（128，128）时为（B, 128*8*8=8192）
-            nn.Linear(128*8*8, self.embed_dim),  # [B, embed_dim],输入为（640，480）
-        )
+        self.use_spatial_adapter = use_spatial_adapter
+        if use_spatial_adapter:
+            self.backbone_dim = backbone_dim
+
+            # 添加空间压缩层（保持合理分辨率）
+            self.spatial_adapter = nn.Sequential(
+                nn.Conv2d(backbone_dim, 512, 3, padding=1), #[B, 512, 45, 34]
+                nn.ReLU(),
+                nn.Conv2d(512, 256, 3, padding=1), #[B, 256, 45, 34]
+                nn.ReLU(),
+                nn.Conv2d(256, 128, kernel_size=3, stride=2, padding=1),  # 输出 [B,128,22,17]
+                nn.AdaptiveAvgPool2d((18, 23)),
+                nn.Flatten(1), # [B, 128*(H*W)],输入为（640，480）时为（B, 128*23*18=52992）
+                nn.Linear(128*23*18, self.embed_dim),  # [B, embed_dim]
+                nn.LayerNorm(self.embed_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.10)
+            )
+            self.spatial_adpater_low = nn.Sequential(
+                nn.Conv2d(backbone_dim, 512, 3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(512, 256, 3, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(256, 128, 3, padding=1),
+                nn.AdaptiveAvgPool2d((8, 8)),
+                nn.Flatten(1),  # [B, 128*(H*W)],输入为（128，128）时为（B, 128*8*8=8192）
+                nn.Linear(128*8*8, self.embed_dim),  # [B, embed_dim],输入为（640，480）
+            )
         # 输入特征的拼接和投影
         # self.in_dim = embed_dim + lowdim_dim
         self.cross_attn = CrossModalAttention(d_model, lowdim_dim=lowdim_dim)
@@ -657,12 +664,18 @@ class MambaPolicy(nn.Module):
         feats_all = []
         for cam in self.camera_names:
             img = images_t[cam]
-            raw_feat = self.shared_backbone(img)  # [B, 1024, H_patch, W_patch]
-            # 空间压缩与通道调整
-            if self.img_size == (640, 480):
-                feat = self.spatial_adapter(raw_feat)  # [B, 128*11*8]
-            elif self.img_size == (128, 128):
-                feat = self.spatial_adapter_low(raw_feat) # [B, 128*8*8]
+            if self.shared_backbone is not None:
+                raw_feat = self.shared_backbone(img)  # [B, 1024, H_patch, W_patch]
+            else:
+                raw_feat = img
+            if self.use_spatial_adapter:
+                # 空间压缩与通道调整
+                if not self.low_res_adapter:
+                    feat = self.spatial_adapter(raw_feat)  # [B, 128*11*8]
+                else:
+                    feat = self.spatial_adapter_low(raw_feat) # [B, 128*8*8]
+            else:
+                feat = raw_feat
             feats_all.append(feat)
 
         cam_feats = torch.cat(feats_all, dim=1)
