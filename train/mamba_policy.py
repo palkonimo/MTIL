@@ -511,6 +511,8 @@ import torch
 # import torch.nn as nn
 from torchvision import models
 
+DinoV2 = object()
+
 class MambaPolicy(nn.Module):
     """
     多相机 + lowdim -> backbone -> concat/sum -> in_proj -> Block (with Mamba2) -> action
@@ -528,7 +530,7 @@ class MambaPolicy(nn.Module):
         mamba_cfg=None,  # Mamba2 的配置
         future_steps=16,  # 预测未来16步，可调
         backbone_dim = 1024,
-        backbone = FrozenDinov2(layer_index=-4),
+        backbone = DinoV2,
         use_spatial_adapter: bool = True,
         low_res_adapter: bool = False,
     ):
@@ -545,6 +547,8 @@ class MambaPolicy(nn.Module):
             mamba_cfg = MambaConfig()
         self.mamba_cfg = mamba_cfg
         # 初始化DINOv2特征提取器
+        if backbone == DinoV2:
+            backbone = FrozenDinov2(layer_index=-4)
         self.shared_backbone = backbone
 
         self.use_spatial_adapter = use_spatial_adapter
@@ -578,7 +582,10 @@ class MambaPolicy(nn.Module):
         # 输入特征的拼接和投影
         # self.in_dim = embed_dim + lowdim_dim
         self.cross_attn = CrossModalAttention(d_model, lowdim_dim=lowdim_dim)
-        self.in_dim = embed_dim * len(self.camera_names)
+        if self.use_spatial_adapter:
+            self.in_dim = embed_dim * len(self.camera_names)
+        else:
+            self.in_dim = backbone_dim * len(self.camera_names)
         # 跨相机交叉注意力模块
         self.num_cameras = len(camera_names)
         if self.num_cameras > 1:
