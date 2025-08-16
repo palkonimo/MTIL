@@ -533,6 +533,7 @@ class MambaPolicy(nn.Module):
         backbone = DinoV2,
         use_spatial_adapter: bool = True,
         low_res_adapter: bool = False,
+        use_robot_states: bool = True,
     ):
         super().__init__()
         self.camera_names = camera_names
@@ -581,7 +582,10 @@ class MambaPolicy(nn.Module):
             )
         # 输入特征的拼接和投影
         # self.in_dim = embed_dim + lowdim_dim
-        self.cross_attn = CrossModalAttention(d_model, lowdim_dim=lowdim_dim)
+
+        self.use_robot_states = use_robot_states
+        if self.use_robot_states:
+            self.cross_attn = CrossModalAttention(d_model, lowdim_dim=lowdim_dim)
         if self.use_spatial_adapter:
             self.in_dim = embed_dim * len(self.camera_names)
         else:
@@ -663,9 +667,9 @@ class MambaPolicy(nn.Module):
           pred_action: [B, action_dim]
           new_hidden_states: List[Tensor]
         """
-        B, _ = lowdim_t.shape
-        device = lowdim_t.device
-        
+        if self.use_robot_states:
+            assert lowdim_t is not None
+
         # 1. 多相机特征提取
 
         feats_all = []
@@ -692,15 +696,19 @@ class MambaPolicy(nn.Module):
                                             cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)).squeeze(1)
 
         # 2. 特征融合与投影
-        lowdim_feat = lowdim_t.unsqueeze(1)  # [B, 1, 14]
         # 投影到d_model并交叉注意力
         cam_feats_proj = self.in_proj(cam_feats)  # [B, d_model]
-        fused_feat = self.cross_attn(
-            query=cam_feats_proj.unsqueeze(1),
-            key=lowdim_feat,
-            value=lowdim_feat
-        ).squeeze(1)
-        x_t = fused_feat # [B, d_model]
+
+        if self.use_robot_states:
+            lowdim_feat = lowdim_t.unsqueeze(1)  # [B, 1, 14]
+            fused_feat = self.cross_attn(
+                query=cam_feats_proj.unsqueeze(1),
+                key=lowdim_feat,
+                value=lowdim_feat
+            ).squeeze(1)
+            x_t = fused_feat # [B, d_model]
+        else:
+            x_t = cam_feats_proj
 
         # 3) 经过 blocks (单步)
         residual = None
