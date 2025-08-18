@@ -534,6 +534,7 @@ class MambaPolicy(nn.Module):
         use_spatial_adapter: bool = True,
         low_res_adapter: bool = False,
         use_robot_states: bool = True,
+        auxiliary_dim: int | None = None,
     ):
         super().__init__()
         self.camera_names = camera_names
@@ -641,6 +642,13 @@ class MambaPolicy(nn.Module):
         self.flat_action_dim = action_dim * future_steps
         self.out_proj = nn.Linear(d_model, self.flat_action_dim)
 
+        self.auxiliary = auxiliary_dim is not None
+        if self.auxiliary:
+            self.auxiliary_head = nn.Sequential(
+                nn.Linear(d_model, d_model),
+                nn.ReLU(),
+                nn.Linear(d_model, auxiliary_dim)
+            )
 
     def init_hidden_states(self, batch_size, device=None):
         """
@@ -748,6 +756,9 @@ class MambaPolicy(nn.Module):
         # d) out => action
         action_flat = self.out_proj(hidden)# => [B, 16×14=224]
         action_t = action_flat.view(-1, self.future_steps, self.action_dim)  # => [B,16,14]
+        if self.auxiliary:
+            aux_pred = self.auxiliary_head(hidden)
+            return action_t, new_states, aux_pred
         return action_t, new_states
 
 # forward一般不使用
