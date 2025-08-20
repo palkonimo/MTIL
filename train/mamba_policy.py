@@ -650,6 +650,9 @@ class MambaPolicy(nn.Module):
                 nn.Linear(d_model, auxiliary_dim)
             )
 
+        self.freeze_perception = False
+        self.training_mode = 'default'
+
     def init_hidden_states(self, batch_size, device=None):
         """
         For single-step inference: gather each block's Mamba2 => allocate_inference_cache
@@ -665,143 +668,210 @@ class MambaPolicy(nn.Module):
             hidden_list.append((conv_st, ssm_st))
         return hidden_list
 
-    def step(self, lowdim_t, images_t, hidden_states):
+    def step(self, lowdim_t, images_t, hidden_states=None, use_hidden_states=True):
         """
-        单帧前向:
+        单帧前向 - 支持有状态和无状态模式:
           lowdim_t: [B, lowdim_dim]
           images_t: dict of [B, 3, H, W] => 单帧输入
           hidden_states: list of (conv_st, ssm_st) per block，每个 Block 的隐藏状态
+          use_hidden_states: bool, 是否使用隐藏状态（训练模式控制）
         返回:
           pred_action: [B, action_dim]
-          new_hidden_states: List[Tensor]
+          new_hidden_states: List[Tensor] (如果use_hidden_states=True)
         """
         if self.use_robot_states:
             assert lowdim_t is not None
 
-        # 1. 多相机特征提取
-
-        feats_all = []
-        for cam in self.camera_names:
-            img = images_t[cam]
-            if self.shared_backbone is not None:
-                raw_feat = self.shared_backbone(img)  # [B, 1024, H_patch, W_patch]
-            else:
-                raw_feat = img
-            if self.use_spatial_adapter:
-                # 空间压缩与通道调整
-                if not self.low_res_adapter:
-                    feat = self.spatial_adapter(raw_feat)  # [B, 128*11*8]
+        # 1. 多相机特征提取 (感知部分 - 可冻结)
+        with torch.set_grad_enabled(not self.freeze_perception):
+            feats_all = []
+            for cam in self.camera_names:
+                img = images_t[cam]
+                if self.shared_backbone is not None:
+                    raw_feat = self.shared_backbone(img)  # [B, 1024, H_patch, W_patch]
                 else:
-                    feat = self.spatial_adapter_low(raw_feat) # [B, 128*8*8]
+                    raw_feat = img
+                if self.use_spatial_adapter:
+                    # 空间压缩与通道调整
+                    if not self.low_res_adapter:
+                        feat = self.spatial_adapter(raw_feat)  # [B, 128*11*8]
+                    else:
+                        feat = self.spatial_adapter_low(raw_feat)  # [B, 128*8*8]
+                else:
+                    feat = raw_feat
+                feats_all.append(feat)
+
+            cam_feats = torch.cat(feats_all, dim=1)
+            # 跨相机注意力
+            if self.num_cameras > 1:
+                cam_feats = self.cross_cam_attn(cam_feats.unsqueeze(1),
+                                                cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)).squeeze(1)
+
+            # 2. 特征融合与投影
+            cam_feats_proj = self.in_proj(cam_feats)  # [B, d_model]
+
+            if self.use_robot_states:
+                lowdim_feat = lowdim_t.unsqueeze(1)  # [B, 1, 14]
+                fused_feat = self.cross_attn(
+                    query=cam_feats_proj.unsqueeze(1),
+                    key=lowdim_feat,
+                    value=lowdim_feat
+                ).squeeze(1)
+                x_t = fused_feat  # [B, d_model]
             else:
-                feat = raw_feat
-            feats_all.append(feat)
+                x_t = cam_feats_proj
 
-        cam_feats = torch.cat(feats_all, dim=1)
-        # 跨相机注意力
-        if self.num_cameras > 1:
-            cam_feats = self.cross_cam_attn(cam_feats.unsqueeze(1),
-                                            cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)).squeeze(1)
+        # 3) 经过 blocks - 根据模式选择有状态或无状态
+        if use_hidden_states and hidden_states is not None:
+            # 有状态模式 (episode fine-tuning)
+            residual = None
+            new_states = []
+            hidden = x_t
+            for i, blk in enumerate(self.blocks):
+                conv_st, ssm_st = hidden_states[i] if i < len(hidden_states) else (None, None)
+                if residual is None:
+                    residual = hidden
+                else:
+                    residual = residual + hidden
 
-        # 2. 特征融合与投影
-        # 投影到d_model并交叉注意力
-        cam_feats_proj = self.in_proj(cam_feats)  # [B, d_model]
+                hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
 
-        if self.use_robot_states:
-            lowdim_feat = lowdim_t.unsqueeze(1)  # [B, 1, 14]
-            fused_feat = self.cross_attn(
-                query=cam_feats_proj.unsqueeze(1),
-                key=lowdim_feat,
-                value=lowdim_feat
-            ).squeeze(1)
-            x_t = fused_feat # [B, d_model]
+                # => step
+                if hasattr(blk.mixer, "step"):
+                    y_t, new_conv_st, new_ssm_st = blk.mixer.step(hidden_ln.unsqueeze(1), conv_st, ssm_st)
+                    y_t = y_t.squeeze(1)  # => (B, d_model)
+                else:
+                    # fallback
+                    y_t = blk.mixer(hidden_ln.unsqueeze(1))
+                    y_t = y_t.squeeze(1)
+                    new_conv_st, new_ssm_st = conv_st, ssm_st
+
+                hidden_out = y_t + residual
+
+                # mlp
+                if blk.mlp is not None:
+                    r2 = blk.norm2(hidden_out.to(dtype=blk.norm2.weight.dtype))
+                    hidden_out = blk.mlp(r2) + hidden_out
+
+                new_states.append((new_conv_st, new_ssm_st))
+                hidden = hidden_out
+                residual = hidden_out
         else:
-            x_t = cam_feats_proj
+            # 无状态模式 (non-episodic pre-training)
+            residual = None
+            hidden = x_t
+            for i, blk in enumerate(self.blocks):
+                if residual is None:
+                    residual = hidden
+                else:
+                    residual = residual + hidden
 
-        # 3) 经过 blocks (单步)
-        residual = None
-        new_states = []
-        hidden = x_t
-        for i, blk in enumerate(self.blocks):
-            conv_st, ssm_st = hidden_states[i] if i < len(hidden_states) else (None, None)
-            if residual is None:
-                residual = hidden
-            else:
-                residual = residual + hidden
+                hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
 
-            hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
+                # 直接前向传播，忽略状态
+                torch.cuda.synchronize()
+                y_t = blk.mixer(hidden_ln.unsqueeze(1)).squeeze(1)
+                torch.cuda.synchronize()
+                hidden_out = y_t + residual
 
-            # => step
-            # we need: out, new_conv, new_ssm = blk.mixer.step(...)
-            if hasattr(blk.mixer, "step"):
-                y_t, new_conv_st, new_ssm_st = blk.mixer.step(hidden_ln.unsqueeze(1), conv_st, ssm_st)
-                y_t = y_t.squeeze(1)   # => (B, d_model)
-            else:
-                # fallback
-                y_t = blk.mixer(hidden_ln.unsqueeze(1))
-                y_t = y_t.squeeze(1)
-                new_conv_st, new_ssm_st = conv_st, ssm_st
+                # mlp
+                if blk.mlp is not None:
+                    r2 = blk.norm2(hidden_out.to(dtype=blk.norm2.weight.dtype))
+                    hidden_out = blk.mlp(r2) + hidden_out
 
-            hidden_out = y_t + residual
+                hidden = hidden_out
+                residual = hidden_out
 
-            # mlp
-            if blk.mlp is not None:
-                r2 = blk.norm2(hidden_out.to(dtype=blk.norm2.weight.dtype))
-                hidden_out = blk.mlp(r2) + hidden_out
-
-            new_states.append((new_conv_st, new_ssm_st))
-            hidden = hidden_out
-            residual = hidden_out
+            new_states = None
 
         # d) out => action
-        action_flat = self.out_proj(hidden)# => [B, 16×14=224]
+        action_flat = self.out_proj(hidden)  # => [B, 16×14=224]
         action_t = action_flat.view(-1, self.future_steps, self.action_dim)  # => [B,16,14]
+
         if self.auxiliary:
             aux_pred = self.auxiliary_head(hidden)
-            return action_t, new_states, aux_pred
-        return action_t, new_states
-
-# forward一般不使用
-    def forward(self, lowdim, images):
-        """
-        lowdim: [B, L, lowdim_dim]
-        images: dict of [B, L, 3, H, W]
-        返回: [B, L, action_dim]
-        """
-        device = lowdim.device
-        B, L, _ = lowdim.shape
-
-        # 1. 多相机特征提取
-        feats_all = []
-        for cam in self.camera_names:
-            if cam not in images:
-                feats_all.append(torch.zeros(B, L, self.embed_dim, device=device))
-                continue
-            x = images[cam]
-            x = x.view(B * L, *x.shape[2:])
-            net = self.backbones[cam]
-            feats = net(x)  # [B*L,512,15,20]
-            projected_feat = self.feature_extractors(feats)
-            projected_feat = projected_feat.view(B, L, -1)
-            feats_all.append(projected_feat)
-
-        if self.sum_camera_feats:
-            cam_feats = torch.stack(feats_all, dim=0).sum(dim=0)
+            if use_hidden_states:
+                return action_t, new_states, aux_pred
+            else:
+                return action_t, aux_pred
         else:
-            cam_feats = torch.cat(feats_all, dim=2)
+            if use_hidden_states:
+                return action_t, new_states
+            else:
+                return action_t
 
-        # 2. 特征拼接与投影
-        x = torch.cat([cam_feats, lowdim], dim=2)
-        x = self.in_proj(x)
+    def forward(self, lowdim_obs, images, use_hidden_states=False, sequence_length=None):
+        """
+        完整序列前向传播 - 用于非episodic训练
+        Args:
+            lowdim_obs: [B, T, lowdim_dim] 或 [B, lowdim_dim]
+            images: dict of [B, T, 3, H, W] 或 [B, 3, H, W]
+            use_hidden_states: 是否使用隐藏状态
+            sequence_length: 序列长度（用于非episodic数据）
+        """
+        if use_hidden_states:
+            # Episode模式 - 需要逐步调用step
+            raise NotImplementedError("Use step() method for episodic/hidden state mode")
 
-        # 3. 逐层通过 Block
-        residual = None
-        for blk in self.blocks:
-            x, residual = blk(x, residual)
+        # 处理输入维度
+        if lowdim_obs.dim() == 2:  # [B, lowdim_dim]
+            lowdim_obs = lowdim_obs.unsqueeze(1)  # [B, 1, lowdim_dim]
+        if list(images.values())[0].dim() == 4:  # [B, 3, H, W]
+            for cam in images:
+                images[cam] = images[cam].unsqueeze(1)  # [B, 1, 3, H, W]
 
-        # 4. 输出动作
-        actions = self.out_proj(x)
-        actions = actions.view(B, L, self.future_steps, self.action_dim)
-        return actions
+        B, T = lowdim_obs.shape[:2]
+        all_actions = []
 
+        # 逐帧处理（无状态）
+        for t in range(T):
+            lowdim_t = lowdim_obs[:, t]  # [B, lowdim_dim]
+            images_t = {cam: images[cam][:, t] for cam in images}  # [B, 3, H, W]
+
+            action_t = self.step(lowdim_t, images_t,
+                                 hidden_states=None,
+                                 use_hidden_states=False)
+            if isinstance(action_t, tuple):  # 有auxiliary输出
+                action_t = action_t[0]
+            all_actions.append(action_t)
+
+        return torch.stack(all_actions, dim=1)  # [B, T, future_steps, action_dim]
+
+    def set_training_mode(self, mode='pretrain'):
+        """
+        Set training mode
+        Args:
+            mode: 'pretrain' or 'finetune'
+        """
+        if mode == 'pretrain':
+            self.freeze_perception = False
+            self.training_mode = 'pretrain'
+            for param in self.parameters():
+                param.requires_grad = True
+        elif mode == 'finetune':
+            self.freeze_perception = True
+            self.training_mode = 'finetune'
+            perception_modules = [
+                self.in_proj
+            ]
+
+            if self.use_robot_states:
+                perception_modules.append(self.cross_attn)
+
+            if self.shared_backbone is not None:
+                perception_modules.append(self.shared_backbone)
+
+            if self.num_cameras > 1:
+                perception_modules.append(self.cross_cam_attn)
+
+            if self.use_spatial_adapter:
+                perception_modules.append(self.spatial_adapter)
+                perception_modules.append(self.spatial_adapter_low)
+
+            for module in perception_modules:
+                if module is not None:
+                    for param in module.parameters():
+                        param.requires_grad = False
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
 
