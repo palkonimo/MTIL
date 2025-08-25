@@ -535,6 +535,7 @@ class MambaPolicy(nn.Module):
         low_res_adapter: bool = False,
         use_robot_states: bool = True,
         auxiliary_dim: int | None = None,
+        lang_dim: int = None
     ):
         super().__init__()
         self.camera_names = camera_names
@@ -597,6 +598,9 @@ class MambaPolicy(nn.Module):
             self.cross_cam_attn = CrossCameraAttention(d_model=self.in_dim)
         self.in_proj = nn.Linear(self.in_dim, d_model)
 
+        if lang_dim is not None:
+            d_model += lang_dim
+
         # Block 配置
         if block_cfg is None:
             block_cfg = {}
@@ -629,7 +633,7 @@ class MambaPolicy(nn.Module):
         # 构建多个 Block
         self.blocks = nn.ModuleList([
             Block(
-                dim=self.d_model,
+                dim=d_model,
                 mixer_cls=mixer_fn,
                 mlp_cls=mlp_fn,
                 norm_cls=nn.LayerNorm,
@@ -668,7 +672,7 @@ class MambaPolicy(nn.Module):
             hidden_list.append((conv_st, ssm_st))
         return hidden_list
 
-    def step(self, lowdim_t, images_t, hidden_states=None, use_hidden_states=True):
+    def step(self, lowdim_t, images_t, hidden_states=None, use_hidden_states=True, lang_emb=None):
         """
         单帧前向 - 支持有状态和无状态模式:
           lowdim_t: [B, lowdim_dim]
@@ -720,6 +724,9 @@ class MambaPolicy(nn.Module):
                 x_t = fused_feat  # [B, d_model]
             else:
                 x_t = cam_feats_proj
+
+        if lang_emb is not None:
+            x_t = torch.cat((x_t, lang_emb.squeeze()), dim=1)
 
         # 3) 经过 blocks - 根据模式选择有状态或无状态
         if use_hidden_states and hidden_states is not None:
