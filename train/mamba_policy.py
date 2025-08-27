@@ -597,10 +597,10 @@ class MambaPolicy(nn.Module):
         if self.num_cameras > 1:
             self.cross_cam_attn = CrossCameraAttention(d_model=self.in_dim)
 
+        self.in_proj = nn.Linear(self.in_dim, d_model)
         if lang_dim is not None:
-            self.in_proj = nn.Linear(self.in_dim + lang_dim, d_model)
-        else:
-            self.in_proj = nn.Linear(self.in_dim, d_model)
+            self.lang_proj = nn.Linear(lang_dim, d_model)
+            self.fusion_proj = nn.Linear(2 * d_model, d_model)
 
         # Block 配置
         if block_cfg is None:
@@ -712,11 +712,12 @@ class MambaPolicy(nn.Module):
                 cam_feats = self.cross_cam_attn(cam_feats.unsqueeze(1),
                                                 cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)).squeeze(1)
 
-            if lang_emb is not None:
-                cam_feats = torch.cat((cam_feats, lang_emb.squeeze(1)), dim=1)
-
             # 2. 特征融合与投影
             cam_feats_proj = self.in_proj(cam_feats)  # [B, d_model]
+
+            if lang_emb is not None:
+                lang_feats = self.lang_proj(lang_emb.squeeze(1))
+                cam_feats_proj = self.fusion_proj(torch.cat((cam_feats_proj, lang_feats), dim=1))
 
             if self.use_robot_states:
                 lowdim_feat = lowdim_t.unsqueeze(1)  # [B, 1, 14]
