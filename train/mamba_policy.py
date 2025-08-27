@@ -596,10 +596,11 @@ class MambaPolicy(nn.Module):
         self.num_cameras = len(camera_names)
         if self.num_cameras > 1:
             self.cross_cam_attn = CrossCameraAttention(d_model=self.in_dim)
-        self.in_proj = nn.Linear(self.in_dim, d_model)
 
         if lang_dim is not None:
-            d_model += lang_dim
+            self.in_proj = nn.Linear(self.in_dim + lang_dim, d_model)
+        else:
+            self.in_proj = nn.Linear(self.in_dim, d_model)
 
         # Block 配置
         if block_cfg is None:
@@ -711,6 +712,9 @@ class MambaPolicy(nn.Module):
                 cam_feats = self.cross_cam_attn(cam_feats.unsqueeze(1),
                                                 cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)).squeeze(1)
 
+            if lang_emb is not None:
+                cam_feats = torch.cat((cam_feats, lang_emb.squeeze(1)), dim=1)
+
             # 2. 特征融合与投影
             cam_feats_proj = self.in_proj(cam_feats)  # [B, d_model]
 
@@ -724,9 +728,6 @@ class MambaPolicy(nn.Module):
                 x_t = fused_feat  # [B, d_model]
             else:
                 x_t = cam_feats_proj
-
-        if lang_emb is not None:
-            x_t = torch.cat((x_t, lang_emb.squeeze()), dim=1)
 
         # 3) 经过 blocks - 根据模式选择有状态或无状态
         if use_hidden_states and hidden_states is not None:
@@ -775,10 +776,7 @@ class MambaPolicy(nn.Module):
 
                 hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
 
-                # 直接前向传播，忽略状态
-                torch.cuda.synchronize()
                 y_t = blk.mixer(hidden_ln.unsqueeze(1)).squeeze(1)
-                torch.cuda.synchronize()
                 hidden_out = y_t + residual
 
                 # mlp
