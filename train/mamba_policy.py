@@ -706,25 +706,30 @@ class MambaPolicy(nn.Module):
                     feat = raw_feat
                 feats_all.append(feat)
 
-            cam_feats = torch.cat(feats_all, dim=1)
+            cam_feats = torch.cat(feats_all, dim=-1)
             # 跨相机注意力
             if self.num_cameras > 1:
-                cam_feats = self.cross_cam_attn(cam_feats.unsqueeze(1),
-                                                cam_feats.unsqueeze(1), cam_feats.unsqueeze(1)).squeeze(1)
+                if cam_feats.ndim == 2:
+                    cam_feats = cam_feats.unsqueeze(1)
+                cam_feats = self.cross_cam_attn(cam_feats, cam_feats, cam_feats).squeeze(1)
 
             # 2. 特征融合与投影
             cam_feats_proj = self.in_proj(cam_feats)  # [B, d_model]
+            orig_shape = cam_feats_proj.shape[:-1]
 
             if lang_emb is not None:
                 lang_feats = self.lang_proj(lang_emb.squeeze(1))
-                cam_feats_proj = self.fusion_proj(torch.cat((cam_feats_proj, lang_feats), dim=1))
+                cam_feats_proj = self.fusion_proj(torch.cat((cam_feats_proj, lang_feats), dim=-1))
 
             if self.use_robot_states:
-                lowdim_feat = lowdim_t.unsqueeze(1)  # [B, 1, 14]
+                if lowdim_t.ndim == 2:
+                    lowdim_t = lowdim_t.unsqueeze(1)
+                if cam_feats_proj.ndim == 2:
+                    cam_feats_proj = cam_feats_proj.unsqueeze(1)
                 fused_feat = self.cross_attn(
-                    query=cam_feats_proj.unsqueeze(1),
-                    key=lowdim_feat,
-                    value=lowdim_feat
+                    query=cam_feats_proj,
+                    key=lowdim_t,
+                    value=lowdim_t
                 ).squeeze(1)
                 x_t = fused_feat  # [B, d_model]
             else:
@@ -745,13 +750,16 @@ class MambaPolicy(nn.Module):
 
                 hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
 
+                if hidden_ln.ndim == 2:
+                    hidden_ln = hidden_ln.unsqueeze(1)
+
                 # => step
                 if hasattr(blk.mixer, "step"):
-                    y_t, new_conv_st, new_ssm_st = blk.mixer.step(hidden_ln.unsqueeze(1), conv_st, ssm_st)
+                    y_t, new_conv_st, new_ssm_st = blk.mixer.step(hidden_ln, conv_st, ssm_st)
                     y_t = y_t.squeeze(1)  # => (B, d_model)
                 else:
                     # fallback
-                    y_t = blk.mixer(hidden_ln.unsqueeze(1))
+                    y_t = blk.mixer(hidden_ln)
                     y_t = y_t.squeeze(1)
                     new_conv_st, new_ssm_st = conv_st, ssm_st
 
@@ -777,7 +785,9 @@ class MambaPolicy(nn.Module):
 
                 hidden_ln = blk.norm(residual.to(dtype=blk.norm.weight.dtype))
 
-                y_t = blk.mixer(hidden_ln.unsqueeze(1)).squeeze(1)
+                if hidden_ln.ndim == 2:
+                    hidden_ln = hidden_ln.unsqueeze(1)
+                y_t = blk.mixer(hidden_ln).squeeze(1)
                 hidden_out = y_t + residual
 
                 # mlp
@@ -792,7 +802,7 @@ class MambaPolicy(nn.Module):
 
         # d) out => action
         action_flat = self.out_proj(hidden)  # => [B, 16×14=224]
-        action_t = action_flat.view(-1, self.future_steps, self.action_dim)  # => [B,16,14]
+        action_t = action_flat.view(*orig_shape, self.future_steps, self.action_dim)  # => [B,16,14]
 
         if self.auxiliary:
             aux_pred = self.auxiliary_head(hidden)
